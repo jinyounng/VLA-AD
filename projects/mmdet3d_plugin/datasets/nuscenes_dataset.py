@@ -39,12 +39,14 @@ class CustomNuScenesDataset(NuScenesDataset):
                  lane_path='./data/nuscenes/data_dict_sample.pkl',
                  lane_anno_file='./data/nuscenes/data_dict_subset_B_val.pkl',
                  eval_mode=['lane', 'det'],
+                 skip_missing_assets=True,
                  *args, 
                  **kwargs):
         super().__init__(*args, **kwargs)
         
         self.seq_mode = seq_mode
         self.eval_mode = eval_mode
+        self.skip_missing_assets = skip_missing_assets
         self.lane_info = pickle.load(open(lane_path, 'rb'))
         self.vqa_data = dict()
         self.lane_anno_file = lane_anno_file
@@ -93,7 +95,17 @@ class CustomNuScenesDataset(NuScenesDataset):
                 assert len(new_flags) == len(self.flag)
                 self.flag = np.array(new_flags, dtype=np.int64)
 
-    
+    def _resolve_sample_path(self, path):
+        """PKL may store paths as ./data/nuscenes/...; remap to self.data_root."""
+        if not path or not isinstance(path, str):
+            return path
+        normalized = path.replace('\\', '/')
+        for prefix in ('./data/nuscenes/', 'data/nuscenes/'):
+            if normalized.startswith(prefix):
+                rel = normalized[len(prefix):].lstrip('/')
+                return osp.join(self.data_root, rel)
+        return path
+
     def get_data_info(self, index):
         """Get data info according to the given index.
 
@@ -123,14 +135,21 @@ class CustomNuScenesDataset(NuScenesDataset):
         ego_pose_inv = invert_matrix_egopose_numpy(ego_pose)
         
             
+        sweeps_resolved = []
+        for sw in info['sweeps']:
+            sw = dict(sw)
+            if 'data_path' in sw:
+                sw['data_path'] = self._resolve_sample_path(sw['data_path'])
+            sweeps_resolved.append(sw)
+
         input_dict = dict(
             can_bus = info['can_bus'],
             command = info['gt_planning_command'],
             command_desc = info['gt_planning_command_desc'],
             location=info['location'].split("-")[0],
             sample_idx=info['token'],
-            pts_filename=info['lidar_path'],
-            sweeps=info['sweeps'],
+            pts_filename=self._resolve_sample_path(info['lidar_path']),
+            sweeps=sweeps_resolved,
             ego_pose=ego_pose,
             ego_pose_inv = ego_pose_inv,
             prev_idx=info['prev'],
@@ -149,7 +168,7 @@ class CustomNuScenesDataset(NuScenesDataset):
             img_timestamp = []
             for cam_type, cam_info in info['cams'].items():
                 img_timestamp.append(cam_info['timestamp'] / 1e6)
-                image_paths.append(cam_info['data_path'])
+                image_paths.append(self._resolve_sample_path(cam_info['data_path']))
                 cam2lidar_r = Quaternion(cam_info['sensor2ego_rotation']).rotation_matrix
                 cam2lidar_t = cam_info['sensor2ego_translation']
                 cam2lidar_rt = convert_egopose_to_matrix_numpy(cam2lidar_r, cam2lidar_t)
@@ -200,6 +219,14 @@ class CustomNuScenesDataset(NuScenesDataset):
             
         return input_dict
 
+    def prepare_train_data(self, index):
+        """Like the parent, but return None on missing files so __getitem__ can resample."""
+        try:
+            return super().prepare_train_data(index)
+        except (FileNotFoundError, OSError):
+            if not self.skip_missing_assets:
+                raise
+            return None
 
     def __getitem__(self, idx):
         """Get item from infos according to the given index.

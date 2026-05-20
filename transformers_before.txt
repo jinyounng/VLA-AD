@@ -1,0 +1,20 @@
+=== date ===
+2026-04-19T17:25:20+09:00
+=== python ===
+/data/jykim/anaconda3/envs/spacedrive/bin/python3
+Python 3.9.25
+=== pip transformers ===
+Name: transformers
+Version: 4.52.1
+Summary: State-of-the-art Machine Learning for JAX, PyTorch and TensorFlow
+Home-page: https://github.com/huggingface/transformers
+Author: The Hugging Face team (past and future) with the help of all our contributors (https://github.com/huggingface/transformers/graphs/contributors)
+Author-email: transformers@huggingface.co
+License: Apache 2.0 License
+Location: /data/jykim/anaconda3/envs/spacedrive/lib/python3.9/site-packages
+Requires: filelock, huggingface-hub, numpy, packaging, pyyaml, regex, requests, safetensors, tokenizers, tqdm
+Required-by: peft
+=== import transformers ===
+4.52.1
+=== torch ===
+2.1.2+cu121

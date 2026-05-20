@@ -13,11 +13,13 @@ class_names = [
 ]
 
 ############### Training config ###############
-num_gpus = 8
+num_gpus = 2
 batch_size = 1
 num_epochs = 6 
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)
-lr = 1e-4 /2 * batch_size / 8 * num_gpus
+# Effective batch = num_gpus * batch_size * cumulative_iters (1*1*8 = 8).
+cumulative_iters = 4
+lr = 1e-4 /2
 
 ############### SpaceDrive Config ###############
 vis_3d_pos = True # enable PE on vision tokens
@@ -267,7 +269,13 @@ optimizer = dict(constructor='LearningRateDecayOptimizerConstructor', type='Adam
                                 'num_layers': 24,
                                 })
 
-optimizer_config = dict(type='Fp16OptimizerHook', loss_scale='dynamic', grad_clip=dict(max_norm=35, norm_type=2))
+optimizer_config = dict(
+    type='GradientCumulativeFp16OptimizerHook',
+    cumulative_iters=cumulative_iters,
+    loss_scale='dynamic',
+    grad_clip=dict(max_norm=35, norm_type=2),
+    distributed=True,
+)
 # learning policy
 lr_config = dict(
     policy='CosineAnnealing',

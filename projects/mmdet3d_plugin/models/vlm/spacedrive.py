@@ -32,6 +32,7 @@ from ...datasets.utils.constants import IGNORE_INDEX , IMAGE_TOKEN_INDEX, VISION
 from ..vlm_utils.misc import load_model, locations
 from ..vlm_utils.positional_encoding import PositionalEncoding3D
 from ..vlm_utils.distributions import  VAEPEDecoder
+from ..vlm_utils.precomputed_depth import PrecomputedDepthStore
 
 # Unidepth imports
 from unidepth.models import UniDepthV2
@@ -76,6 +77,7 @@ class SpaceDrive(MVXTwoStageDetector):
                  with_cur=False,
                  learnable_pe_scaling=False, # if True, the pe_scaling is learnable, if False, the pe_scaling is fixed
                  depth_model_type = 'depth_anything', # 'depth_anything' or 'unidepth'
+                 precomputed_depth_root=None, # optional root dir for precomputed depth .pt files
                  use_rope = False,
                  ):
         
@@ -109,6 +111,9 @@ class SpaceDrive(MVXTwoStageDetector):
 
         # paths
         self.save_path = save_path
+        self.precomputed_depth_store = None
+        if precomputed_depth_root is not None:
+            self.precomputed_depth_store = PrecomputedDepthStore(precomputed_depth_root)
 
         # concept testing config
         self.single_token_output = single_token_output # use single output token to decode 6 coords
@@ -171,19 +176,22 @@ class SpaceDrive(MVXTwoStageDetector):
         # depth model init
         if self.vis_3d_pos:
             self.depth_model_type = depth_model_type
-            if self.depth_model_type == 'depth_anything':
-                self.depth_anything_processor =  AutoImageProcessor.from_pretrained("depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf")
-                self.depth_model  = AutoModelForDepthEstimation.from_pretrained("depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf", device_map= {'':torch.cuda.current_device()}) 
+            self.depth_model = None
+            # When precomputed depth is enabled, do not load heavy depth backbones.
+            if self.precomputed_depth_store is None:
+                if self.depth_model_type == 'depth_anything':
+                    self.depth_anything_processor =  AutoImageProcessor.from_pretrained("depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf")
+                    self.depth_model  = AutoModelForDepthEstimation.from_pretrained("depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf", device_map= {'':torch.cuda.current_device()}) 
 
-            elif self.depth_model_type == 'unidepth':
-                type_ = "l"  # available types: s, b, l
-                name = f"unidepth-v2-vit{type_}14"
-                self.depth_model = UniDepthV2.from_pretrained(f"lpiccinelli/{name}").eval()
-                self.depth_model.interpolation_mode = "bilinear"
+                elif self.depth_model_type == 'unidepth':
+                    type_ = "l"  # available types: s, b, l
+                    name = f"unidepth-v2-vit{type_}14"
+                    self.depth_model = UniDepthV2.from_pretrained(f"lpiccinelli/{name}").eval()
+                    self.depth_model.interpolation_mode = "bilinear"
 
-            # freeze depth model
-            for param in self.depth_model.parameters():
-                param.requires_grad = False
+                # freeze depth model
+                for param in self.depth_model.parameters():
+                    param.requires_grad = False
 
 
         # loss init
@@ -259,7 +267,11 @@ class SpaceDrive(MVXTwoStageDetector):
         """bool: Whether the detector has a lm head."""
         return hasattr(self,
                        'lm_head') and self.lm_head is not None
-        
+
+    def _extra_lm_forward_kwargs(self, input_ids):
+        """Optional multimodal kwargs for `lm_head` / `generate` (see `SpaceDriveQwen3VL`)."""
+        return {}
+
     ############### 3D position functions ###############
     def prepare_location(self,image_grid_thw , pixel_values):
         pad_h, pad_w = image_grid_thw[0][0][1:3] * self.stride
@@ -270,7 +282,26 @@ class SpaceDrive(MVXTwoStageDetector):
         location = locations(x, self.stride, pad_h, pad_w)[None].repeat(bs*n, 1, 1, 1) # NOTE: stride must match the resolution from qwen_utils
         return location
 
-    def depth_prediction(self, img, intrinsics= None):
+    def _extract_sample_ids(self, img_metas, batch_size):
+        if img_metas is None:
+            return None
+
+        if isinstance(img_metas, (list, tuple)):
+            if len(img_metas) == 0:
+                return None
+            # Test-time wrappers may add one more nesting level.
+            if isinstance(img_metas[0], (list, tuple)):
+                img_metas = [x[0] for x in img_metas if len(x) > 0]
+            sample_ids = []
+            for meta in img_metas:
+                if not isinstance(meta, dict) or 'sample_idx' not in meta:
+                    return None
+                sample_ids.append(str(meta['sample_idx']))
+            if len(sample_ids) == batch_size:
+                return sample_ids
+        return None
+
+    def depth_prediction(self, img, intrinsics= None, img_metas=None):
         '''
         predict the depth of multi_view image 
         Args:
@@ -280,6 +311,28 @@ class SpaceDrive(MVXTwoStageDetector):
         '''
         B, N, C, H, W = img.shape
         device = img.device
+
+        if self.precomputed_depth_store is not None:
+            sample_ids = self._extract_sample_ids(img_metas, B)
+            if sample_ids is None:
+                raise RuntimeError(
+                    "Precomputed depth is enabled, but sample_idx metadata is missing. "
+                    "Please ensure img_metas contains sample_idx for every batch item."
+                )
+            cached = self.precomputed_depth_store.load_batch(
+                sample_ids=sample_ids,
+                num_views=N,
+                height=H,
+                width=W,
+                device=device,
+                dtype=img.dtype,
+            )
+            if cached is not None:
+                return cached
+            raise RuntimeError(
+                "Precomputed depth is enabled, but cache file is missing or shape mismatched. "
+                "Regenerate cache or fix precomputed_depth_root."
+            )
 
         if self.depth_model_type == 'depth_anything':
             img = img.reshape(-1, img.shape[-3], img.shape[-2], img.shape[-1]).permute(0, 2, 3, 1) # (batch_size * num_views, H, W, 3)
@@ -577,7 +630,7 @@ class SpaceDrive(MVXTwoStageDetector):
         
         pos_embed = None
         if self.vis_3d_pos:
-            depth = self.depth_prediction(data['img'], data['intrinsics'])
+            depth = self.depth_prediction(data['img'], data['intrinsics'], img_metas=img_metas)
 
             location = self.prepare_location(image_grid_thw, pixel_values)
 
@@ -620,16 +673,11 @@ class SpaceDrive(MVXTwoStageDetector):
                     else:
                         last_vision_end_token = (input_ids[0] == VISION_END_TOKEN_INDEX).nonzero().max()
 
-                    if self.lm_type == 'llava':
-                        # insert IMAGE_TOKEN_INDEX in between
-                        insert_input_ids = torch.tensor([ IMAGE_TOKEN_INDEX], device = input_ids.device).unsqueeze(0).repeat(B, 1)
-                        insert_labels = torch.tensor([ IGNORE_INDEX], device = vlm_labels.device).unsqueeze(0).repeat(B, 1)
-                        insert_attn_mask = torch.tensor([ 1], device = vlm_attn_mask.device).unsqueeze(0).repeat(B, 1)
-                    else:
-                        # insert <|vision_start|><|image_pad|><|vision_end|> in between
-                        insert_input_ids = torch.tensor([VISION_START_TOKEN_INDEX, IMAGE_TOKEN_INDEX, VISION_END_TOKEN_INDEX], device = input_ids.device).unsqueeze(0).repeat(B, 1)
-                        insert_labels = torch.tensor([IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX], device = vlm_labels.device).unsqueeze(0).repeat(B, 1)
-                        insert_attn_mask = torch.tensor([1, 1, 1], device = vlm_attn_mask.device).unsqueeze(0).repeat(B, 1)
+                    # insert IMAGE_TOKEN_INDEX only — no vision_start/end wrapper to avoid
+                    # get_rope_index treating ego token as a new image region (image_grid_thw mismatch)
+                    insert_input_ids = torch.tensor([IMAGE_TOKEN_INDEX], device=input_ids.device).unsqueeze(0).repeat(B, 1)
+                    insert_labels = torch.tensor([IGNORE_INDEX], device=vlm_labels.device).unsqueeze(0).repeat(B, 1)
+                    insert_attn_mask = torch.tensor([1], device=vlm_attn_mask.device).unsqueeze(0).repeat(B, 1)
 
                     input_ids = torch.cat([input_ids[:, :last_vision_end_token+1], insert_input_ids, input_ids[:, last_vision_end_token+1:]], dim=-1)
                     vlm_labels = torch.cat([vlm_labels[:, :last_vision_end_token+1], insert_labels, vlm_labels[:, last_vision_end_token+1:]], dim=-1)
@@ -679,6 +727,7 @@ class SpaceDrive(MVXTwoStageDetector):
                 ego_feature = ego_feature if self.ego_status and ego_feature.numel() > 0  else None,
                 enable_pe_input = self.enable_pe_input if self.io_3d_pos else False,
                 pos_index = coords3d if self.use_rope else None,
+                **self._extra_lm_forward_kwargs(input_ids),
             )
 
             losses.update(vlm_loss=lm_loss['loss'])
@@ -766,7 +815,7 @@ class SpaceDrive(MVXTwoStageDetector):
         pos_embed = None
         if self.vis_3d_pos:
 
-            depth = self.depth_prediction(img,  data['intrinsics'])
+            depth = self.depth_prediction(img,  data['intrinsics'], img_metas=img_metas)
 
             location = self.prepare_location(image_grid_thw, pixel_values)
 
@@ -799,14 +848,9 @@ class SpaceDrive(MVXTwoStageDetector):
                     else:
                         last_vision_end_token = (input_ids[0] == VISION_END_TOKEN_INDEX).nonzero().max()
 
-                    # insert <|vision_start|><|image_pad|><|vision_end|> in between
-                    if 'llava' in self.lm_path:
-                        # insert <|vision_start|><|image_pad|><|vision_end|> in between
-                        insert_input_ids = torch.tensor([ IMAGE_TOKEN_INDEX], device = input_ids.device).unsqueeze(0)
-                        insert_attn_mask = torch.tensor([ 1], device = input_ids.device).unsqueeze(0)
-                    else:
-                        insert_input_ids = torch.tensor([VISION_START_TOKEN_INDEX, IMAGE_TOKEN_INDEX, VISION_END_TOKEN_INDEX], device = input_ids.device).unsqueeze(0)
-                        insert_attn_mask = torch.tensor([1, 1, 1], device = attention_mask.device).unsqueeze(0)
+                    # insert IMAGE_TOKEN_INDEX only — no vision_start/end wrapper
+                    insert_input_ids = torch.tensor([IMAGE_TOKEN_INDEX], device=input_ids.device).unsqueeze(0)
+                    insert_attn_mask = torch.tensor([1], device=attention_mask.device).unsqueeze(0)
 
                     input_ids = torch.cat([input_ids[:, :last_vision_end_token+1], insert_input_ids, input_ids[:, last_vision_end_token+1:]], dim=-1)
                     attention_mask = torch.cat([attention_mask[:, :last_vision_end_token+1], insert_attn_mask, attention_mask[:, last_vision_end_token+1:]], dim=-1)
@@ -866,7 +910,8 @@ class SpaceDrive(MVXTwoStageDetector):
                         # num_beams=1,
                         ## others
                         max_new_tokens=100,
-                        use_cache=True
+                        use_cache=True,
+                        **self._extra_lm_forward_kwargs(input_ids),
                     )
                 elif self.lm_type == 'llava': # NOTE: no adaption for rope as position encoding in llava, so we don't pass pos_index in this case
                     outputs = self.lm_head.generate( 

@@ -1,3 +1,4 @@
 from .nuscenes_dataset import CustomNuScenesDataset
+from .nuscenes_planning_dataset import CustomNuScenesPlanningDataset
 
 from .builder import custom_build_dataset

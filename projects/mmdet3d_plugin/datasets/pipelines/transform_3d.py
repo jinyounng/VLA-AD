@@ -541,12 +541,16 @@ class LoadAnnoatationVQA():
             raise ValueError("counter_only and enable_online_vqa cannot be both True.")
 
         if llm_type is None:
-            if 'Qwen' in processor or 'qwen' in processor:
+            if 'Qwen3' in processor or 'qwen3-vl' in processor.lower():
+                self.llm_type = 'qwen3vl'
+            elif 'Qwen' in processor or 'qwen' in processor:
                 self.llm_type = 'qwenvl25'
             elif 'Llava' in processor or 'llava' in processor:
                 self.llm_type = 'llava'
+            elif 'SmolVLM' in processor or 'Idefics' in processor or 'smolvlm' in processor:
+                self.llm_type = 'smolvlm'
 
-        if self.llm_type not in ['qwenvl25', 'llava']:
+        if self.llm_type not in ['qwenvl25', 'qwen3vl', 'llava', 'smolvlm']:
             raise ValueError(f"Unsupported llm_type: {self.llm_type}")
         else:
             print(f"Using llm_type: {self.llm_type}")
@@ -554,14 +558,17 @@ class LoadAnnoatationVQA():
         if 'qwen' in self.llm_type:
             self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length)
             if tokenizer is not None:
-                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer,
-                                                )
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
                 self.processor.tokenizer = self.tokenizer
         elif 'llava' in self.llm_type:
-            self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length, num_additional_image_tokens = 24 * 24 * 5 + 1) # clip has the resolution of 336 and patch size of 14. (336 /14 = 24) And we have 5 more images (6 views)
+            self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length, num_additional_image_tokens = 24 * 24 * 5 + 1)
             if tokenizer is not None:
-                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer,
-                                                )
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+                self.processor.tokenizer = self.tokenizer
+        elif self.llm_type == 'smolvlm':
+            self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length)
+            if tokenizer is not None:
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
                 self.processor.tokenizer = self.tokenizer
         self.n_gen = n_gen
         self.ignore_type = ignore_type
@@ -986,7 +993,7 @@ class LoadAnnoatationVQA():
             ]
         }
         '''
-        if self.llm_type == 'qwenvl25':
+        if self.llm_type in ('qwenvl25', 'qwen3vl'):
 
             vqa_anno = [item for pair in sources for item in pair]
             vqa_anno[0]['value'] = (DEFAULT_IMAGE_TOKEN + '\n') * len(results['img']) + prompt + vqa_anno[0]['value']
@@ -1134,6 +1141,59 @@ class LoadAnnoatationVQA():
             vlm_labels = labels[0]
             input_ids = input_ids[0]
             image_grid_thw = torch.tensor([[1, 24, 24]*6], device=input_ids.device).reshape(6,3)
+
+        elif self.llm_type == 'smolvlm':
+            vqa_anno = [item for pair in sources for item in pair]
+            vqa_anno[0]['value'] = (DEFAULT_IMAGE_TOKEN + '\n') * len(results['img']) + prompt + vqa_anno[0]['value']
+
+            coords_pos_list = []
+            if self.load_3d_pos == True:
+                if self.counter_only:
+                    for i, conv in enumerate(vqa_anno):
+                        if conv['from'] == 'human':
+                            modified_conv, coords_pos = self.convert_coords_to_pos_embedding(conv['value'])
+                            vqa_anno[i]['value'] = modified_conv
+                            coords_pos_list.append(coords_pos)
+                else:
+                    for i, conv in enumerate(vqa_anno):
+                        modified_conv, coords_pos = self.convert_coords_to_pos_embedding(conv['value'])
+                        vqa_anno[i]['value'] = modified_conv
+                        coords_pos_list.append(coords_pos)
+                if self.single_token_output:
+                    if len(vqa_anno) > 1 and vqa_anno[1]['value'] != '':
+                        vqa_anno[1]['value'] = vqa_anno[1]['value'].split(POS_INDICATOR_TOKEN)[0] + POS_INDICATOR_TOKEN + POS_EMBEDDING_TOKEN + ']'
+
+            for item in vqa_anno:
+                item['role'] = 'user' if 'human' in item.pop('from') else 'assistant'
+                item['content'] = [{"type": "text", "text": item.pop('value')}]
+
+            text_prompt = self.processor.apply_chat_template([vqa_anno], add_generation_prompt=False)
+
+            results['img'] = [images.astype(np.uint8) for images in results['img']]
+            inputs = self.processor(images=results['img'], text=text_prompt, return_tensors='pt')
+
+            input_ids = inputs['input_ids']
+            pixel_values = inputs['pixel_values']
+
+            labels = input_ids.clone()
+            image_token_mask = (input_ids == self.processor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN))
+
+            end_of_utterance_id = self.processor.tokenizer.convert_tokens_to_ids('<end_of_utterance>')
+            assistant_start_id = self.processor.tokenizer.convert_tokens_to_ids('Assistant')
+            eou_positions = (input_ids[0] == end_of_utterance_id).nonzero(as_tuple=True)[0]
+            if len(eou_positions) > 0:
+                first_assistant_end = eou_positions[0].item()
+                labels[0, :first_assistant_end + 1] = -100
+            else:
+                user_part_len = input_ids.shape[1] // 2
+                labels[0, :user_part_len] = -100
+
+            labels[image_token_mask] = -100
+
+            vlm_labels = labels[0]
+            input_ids = input_ids[0]
+            image_grid_thw = torch.tensor([[1, 8, 8]] * 6, device=input_ids.device).reshape(6, 3)
+
         results['input_ids'] = input_ids
         results['vlm_labels'] = vlm_labels
         results['image_grid_thw'] = image_grid_thw
@@ -1202,12 +1262,16 @@ class LoadAnnoatationVQATest():
         self.llm_type = llm_type
 
         if llm_type is None:
-            if 'Qwen' in processor or 'qwen' in processor:
+            if 'Qwen3' in processor or 'qwen3-vl' in processor.lower():
+                self.llm_type = 'qwen3vl'
+            elif 'Qwen' in processor or 'qwen' in processor:
                 self.llm_type = 'qwenvl25'
             elif 'Llava' in processor or 'llava' in processor:
                 self.llm_type = 'llava'
+            elif 'SmolVLM' in processor or 'Idefics' in processor or 'smolvlm' in processor:
+                self.llm_type = 'smolvlm'
 
-        if self.llm_type not in ['qwenvl25', 'llava']:
+        if self.llm_type not in ['qwenvl25', 'qwen3vl', 'llava', 'smolvlm']:
             raise ValueError(f"Unsupported llm_type: {self.llm_type}")
         else:
             print(f"Using llm_type: {self.llm_type}")
@@ -1215,14 +1279,17 @@ class LoadAnnoatationVQATest():
         if 'qwen' in self.llm_type:
             self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length)
             if tokenizer is not None:
-                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer,
-                                                )
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
                 self.processor.tokenizer = self.tokenizer
         elif 'llava' in self.llm_type:
-            self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length, num_additional_image_tokens = 24 * 24 * 5 + 1) # clip has the resolution of 336 and patch size of 14. (336 /14 = 24) And we have 5 more images (6 views)
+            self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length, num_additional_image_tokens = 24 * 24 * 5 + 1)
             if tokenizer is not None:
-                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer,
-                                                )
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+                self.processor.tokenizer = self.tokenizer
+        elif self.llm_type == 'smolvlm':
+            self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length)
+            if tokenizer is not None:
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
                 self.processor.tokenizer = self.tokenizer
 
         if self.num_commands!=3:
@@ -1331,16 +1398,15 @@ class LoadAnnoatationVQATest():
                     anno[0]['value']  = results['command_desc'] + anno[0]['value'] 
 
 
-                if self.llm_type == 'qwenvl25':
+                if self.llm_type in ('qwenvl25', 'qwen3vl', 'smolvlm'):
                     anno[0]['value'] = (DEFAULT_IMAGE_TOKEN + '\n') * len(results['img']) + prompt + anno[0]['value']
                 elif self.llm_type == 'llava':
                     anno[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + prompt + anno[0]['value']
         else:
             sources = [sources[self.counter_idx]] if "counter" in self.load_type else sources
             vlm_labels = [vlm_labels[self.counter_idx]] if "counter" in self.load_type else vlm_labels
-            # print('using counter_idx', self.counter_idx, 'sources', sources, 'vlm_labels', vlm_labels)
             for anno in sources:
-                if self.llm_type == 'qwenvl25':
+                if self.llm_type in ('qwenvl25', 'qwen3vl', 'smolvlm'):
                     anno[0]['value'] = (DEFAULT_IMAGE_TOKEN + '\n') * len(results['img']) + prompt + anno[0]['value']
                 elif self.llm_type == 'llava':
                     anno[0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + prompt + anno[0]['value']
@@ -1359,7 +1425,7 @@ class LoadAnnoatationVQATest():
             "conversations": sources
         }
 
-        if self.llm_type == 'qwenvl25':
+        if self.llm_type in ('qwenvl25', 'qwen3vl'):
             results['img'] = [images.astype(np.uint8) for images in results['img']] 
             visual_processed = self.processor.image_processor(images=results['img'],
                                                             return_tensors="pt",)
@@ -1425,15 +1491,33 @@ class LoadAnnoatationVQATest():
             inputs = self.processor(images= results['img'], text=prompt, return_tensors='pt')
 
             input_ids = inputs['input_ids'][0]
-            pixel_values = inputs['pixel_values'] # shape [n, 3, 336, 336]
+            pixel_values = inputs['pixel_values']
             image_grid_thw = torch.tensor([[1, 24, 24]*6], device=input_ids.device).reshape(6,3)
 
             results['input_ids'] = input_ids
-            # results['question_text'] = vlm_labels # original VQA question , a list of strings
             results['attention_mask'] = torch.ones_like(input_ids)
             results['pixel_values'] = pixel_values
             results['image_grid_thw'] = image_grid_thw
-        
+
+        elif self.llm_type == 'smolvlm':
+            for item in anno:
+                item['role'] = 'user' if 'human' in item.pop('from') else 'assistant'
+                item['content'] = [{"type": "text", "text": item.pop('value')}]
+
+            text_prompt = self.processor.apply_chat_template([anno], add_generation_prompt=True)
+
+            results['img'] = [images.astype(np.uint8) for images in results['img']]
+            inputs = self.processor(images=results['img'], text=text_prompt, return_tensors='pt')
+
+            input_ids = inputs['input_ids'][0]
+            pixel_values = inputs['pixel_values']
+            image_grid_thw = torch.tensor([[1, 8, 8]] * 6, device=input_ids.device).reshape(6, 3)
+
+            results['input_ids'] = input_ids
+            results['attention_mask'] = torch.ones_like(input_ids)
+            results['pixel_values'] = pixel_values
+            results['image_grid_thw'] = image_grid_thw
+
         # This is for the position embedding
         results['coords_pos_list'] = coords_pos_list
         results['coords_pos_tensor'] = torch.cat(coords_pos_list, dim=0) if len(coords_pos_list) > 0 else torch.empty((0, 2))

@@ -1,0 +1,12 @@
+Collecting numba
+  Downloading numba-0.65.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (2.9 kB)
+Collecting llvmlite<0.48,>=0.47.0dev0 (from numba)
+  Downloading llvmlite-0.47.0-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (5.0 kB)
+Requirement already satisfied: numpy>=1.22 in /data/jykim/anaconda3/envs/spacedrive_blackwell/lib/python3.10/site-packages (from numba) (2.2.6)
+Downloading numba-0.65.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (3.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.7/3.7 MB 6.7 MB/s  0:00:00
+Downloading llvmlite-0.47.0-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (56.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 56.3/56.3 MB 20.4 MB/s  0:00:02
+Installing collected packages: llvmlite, numba
+
+Successfully installed llvmlite-0.47.0 numba-0.65.1

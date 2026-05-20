@@ -5,6 +5,17 @@ data/
 work_dirs/
 vis/
 workspace
+results/
+VISTA/
+docker/
+
+.dist_test/
+gt_annotation/
+id_container
+*.pth
+*.pt
+*.safetensors
+*.tar.zst
 
 .vscode
 *.ignore
@@ -15,3 +26,4 @@ workspace
 *.log
 *.pyc
 
+*.pkl

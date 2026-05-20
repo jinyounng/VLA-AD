@@ -4,6 +4,7 @@
 # ------------------------------------------------------------------------
 
 
+import os
 import transformers
 import torch
 
@@ -41,16 +42,46 @@ from torch.distributed._tensor import DTensor
 transformers.modeling_utils.DTensor = DTensor
 
 
-from transformers import AutoProcessor, AutoTokenizer, LlavaForConditionalGeneration, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, AutoTokenizer, LlavaForConditionalGeneration, Qwen2_5_VLForConditionalGeneration, Idefics3ForConditionalGeneration
+
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+except ImportError:
+    Qwen3VLForConditionalGeneration = None
+
+
+def _sync_vocab_size_config(model, tokenizer_len: int):
+    """Qwen VL models may store vocab size on merged config and/or text_config."""
+    if hasattr(model.config, "text_config") and model.config.text_config is not None:
+        model.config.text_config.vocab_size = tokenizer_len
+    if hasattr(model.config, "vocab_size"):
+        model.config.vocab_size = tokenizer_len
+
+
 def add_token(local_ckpt_path, extra_tokens, new_path):
-    if 'llava' in local_ckpt_path:
-        tokenizer = AutoTokenizer.from_pretrained(local_ckpt_path,  local_files_only=True)
-        processor = AutoProcessor.from_pretrained(local_ckpt_path,  local_files_only=True)
-        model = LlavaForConditionalGeneration.from_pretrained(local_ckpt_path, torch_dtype=torch.bfloat16,device_map={'':torch.cuda.current_device()},  local_files_only=True)
-    elif 'Qwen' in local_ckpt_path:
-        tokenizer = AutoTokenizer.from_pretrained(local_ckpt_path,  local_files_only=True)
-        processor = AutoProcessor.from_pretrained(local_ckpt_path,  local_files_only=True)
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(local_ckpt_path, torch_dtype=torch.bfloat16,device_map={'':torch.cuda.current_device()},  local_files_only=True)
+    if 'llava' in local_ckpt_path.lower():
+        tokenizer = AutoTokenizer.from_pretrained(local_ckpt_path, local_files_only=True)
+        processor = AutoProcessor.from_pretrained(local_ckpt_path, local_files_only=True)
+        model = LlavaForConditionalGeneration.from_pretrained(local_ckpt_path, torch_dtype=torch.bfloat16, device_map={'': torch.cuda.current_device()}, local_files_only=True)
+    elif 'Qwen3' in local_ckpt_path or 'qwen3-vl' in local_ckpt_path.lower():
+        if Qwen3VLForConditionalGeneration is None:
+            raise ImportError(
+                "Install a transformers version that provides Qwen3VLForConditionalGeneration "
+                "(e.g. recent transformers with qwen3_vl)."
+            )
+        tokenizer = AutoTokenizer.from_pretrained(local_ckpt_path, local_files_only=True)
+        processor = AutoProcessor.from_pretrained(local_ckpt_path, local_files_only=True)
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            local_ckpt_path, torch_dtype=torch.bfloat16, device_map={'': torch.cuda.current_device()}, local_files_only=True
+        )
+    elif 'SmolVLM' in local_ckpt_path or 'Idefics' in local_ckpt_path or 'smolvlm' in local_ckpt_path.lower():
+        tokenizer = AutoTokenizer.from_pretrained(local_ckpt_path, local_files_only=True)
+        processor = AutoProcessor.from_pretrained(local_ckpt_path, local_files_only=True)
+        model = Idefics3ForConditionalGeneration.from_pretrained(local_ckpt_path, torch_dtype=torch.bfloat16, device_map={'': torch.cuda.current_device()}, local_files_only=True)
+    elif 'Qwen2.5' in local_ckpt_path or 'qwen2.5' in local_ckpt_path.lower() or 'Qwen' in local_ckpt_path:
+        tokenizer = AutoTokenizer.from_pretrained(local_ckpt_path, local_files_only=True)
+        processor = AutoProcessor.from_pretrained(local_ckpt_path, local_files_only=True)
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(local_ckpt_path, torch_dtype=torch.bfloat16, device_map={'': torch.cuda.current_device()}, local_files_only=True)
     else:
         raise NotImplementedError(f"Model type not supported for path {local_ckpt_path}")
     
@@ -77,7 +108,7 @@ def add_token(local_ckpt_path, extra_tokens, new_path):
     print(f"Tokenizer vocabulary size: {len(tokenizer)}")
     print(f"Model embedding layer size: {model.get_input_embeddings().weight.size(0)}")
 
-    model.config.vocab_size = len(tokenizer)
+    _sync_vocab_size_config(model, len(tokenizer))
 
     # save the new model and tokenizer
     model.save_pretrained(new_path)
@@ -86,10 +117,17 @@ def add_token(local_ckpt_path, extra_tokens, new_path):
     print(f"Model, tokenizer, and processor with new tokens saved to {new_path}")
 
 if __name__ == "__main__":
-    local_ckpt_path = "./ckpts/Qwen2.5-VL-7B-Instruct"  # e.g., ./ckpts/llava-1.5-7b-hf"  "path_to_your_model_checkpoint"
-    new_path = "./ckpts/Qwen2.5-VL-7B-Instruct-with-new-special-tokens"  # e.g., "./ckpts/llava-1.5-7b-hf-with-new-special-tokens"  "path_to_save_new_model_with_added_tokens"
-    extra_tokens = ['<POS_INDICATOR>','<POS_EMBEDDING>']
-
+    _root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    # After: huggingface-cli download Qwen/Qwen2.5-VL-3B-Instruct --local-dir ckpts/Qwen2.5-VL-3B-Instruct
+    local_ckpt_path = os.path.join(_root, "ckpts", "Qwen2.5-VL-3B-Instruct")
+    new_path = os.path.join(_root, "ckpts", "Qwen2.5-VL-3B-Instruct-with-new-special-tokens")
+    # Qwen2.5-VL-7B (swap paths if needed):
+    # local_ckpt_path = os.path.join(_root, "ckpts", "Qwen2.5-VL-7B-Instruct")
+    # new_path = os.path.join(_root, "ckpts", "Qwen2.5-VL-7B-Instruct-with-new-special-tokens")
+    # Qwen3-VL (uncomment and install matching transformers if needed)
+    # local_ckpt_path = os.path.join(_root, "ckpts", "Qwen3-VL-2B-Instruct")
+    # new_path = os.path.join(_root, "ckpts", "Qwen3-VL-2B-Instruct-with-new-special-tokens")
+    extra_tokens = ['<POS_INDICATOR>', '<POS_EMBEDDING>']
 
     add_token(local_ckpt_path, extra_tokens, new_path)
 

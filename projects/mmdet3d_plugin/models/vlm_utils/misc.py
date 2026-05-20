@@ -8,9 +8,6 @@ import torch.nn as nn
 
 from peft import LoraConfig, get_peft_model
 
-from ..vlm_utils.custom_qwen import CustomQwen2_5_VLForConditionalGeneration
-from ..vlm_utils.custom_llava import CustomLlavaForConditionalGeneration
-
 def make_row_mask_hook(allowed_row_indices):
     # allowed in training, form like [new_id]
     allowed = torch.tensor(allowed_row_indices, dtype=torch.long)
@@ -26,8 +23,68 @@ def make_row_mask_hook(allowed_row_indices):
     return hook
 
 def load_model(base_model,tokenizer_path, use_lora, frozen, llm_lora_rank=16):
+    # mmcv cfg-options can sometimes pass booleans as strings.
+    if isinstance(use_lora, str):
+        use_lora = use_lora.strip().lower() in ("1", "true", "yes", "y", "on")
+    if isinstance(frozen, str):
+        frozen = frozen.strip().lower() in ("1", "true", "yes", "y", "on")
 
-    if 'Qwen2.5' in base_model:
+    if ('Qwen3' in base_model or 'qwen3-vl' in base_model.lower()):
+        from ..vlm_utils.custom_qwen3vl import CustomQwen3VLForConditionalGeneration
+        model = CustomQwen3VLForConditionalGeneration.from_pretrained(
+            base_model,
+            torch_dtype=torch.bfloat16,
+            device_map={'': torch.cuda.current_device()},
+            local_files_only=True,
+        )
+        model.gradient_checkpointing_enable()
+
+        if use_lora:
+            print('Using LoRA with rank', llm_lora_rank)
+            peft_config = LoraConfig(
+                    r=llm_lora_rank,
+                    lora_alpha=16,
+                    target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
+                    lora_dropout=0.05,
+                    bias="none",
+                    task_type="CAUSAL_LM")
+            model = get_peft_model(model, peft_config)
+
+            for name, param in model.named_parameters():
+                if 'coords' in name:
+                    param.requires_grad = True
+
+        finetune_new_token = 'with-new-special-tokens' in base_model and use_lora
+        if finetune_new_token:
+            new_lm_head = None
+            new_embed_tokens = None
+            for name, param in model.named_parameters():
+                print('loading', name,)
+                if '.lm_head' in name or 'embed_tokens' in name:
+                    print('loading selected', name, param.shape)
+
+                    if '.lm_head' in name:
+                        new_lm_head = nn.Linear(param.shape[1], 2, bias=False).to(param.device)
+                        new_lm_head.weight.data = param.data[-2:, :]
+                        new_lm_head.requires_grad = True
+                    elif '.embed_tokens' in name:
+                        new_embed_tokens = nn.Embedding(2, param.shape[1]).to(param.device)
+                        new_embed_tokens.weight.data = param.data[-2:, :]
+                        new_embed_tokens.requires_grad = True
+                        # for tied weights
+                        if model._tied_weights_keys is not None:
+                            # tried to create new_lm_head
+                            new_lm_head = nn.Linear(param.shape[1], 2, bias=False).to(param.device)
+                            new_lm_head.weight.data = param.data[-2:, :]
+                            new_lm_head.requires_grad = True
+
+            if new_lm_head is not None:
+                model.base_model.model.new_lm_head = new_lm_head
+            if new_embed_tokens is not None:
+                model.base_model.model.model.language_model.new_embed_tokens = new_embed_tokens
+
+    elif 'Qwen2.5' in base_model:
+        from ..vlm_utils.custom_qwen import CustomQwen2_5_VLForConditionalGeneration
         model = CustomQwen2_5_VLForConditionalGeneration.from_pretrained(
             base_model, torch_dtype=torch.bfloat16, device_map= {'':torch.cuda.current_device()}, local_files_only=True, 
         )
@@ -79,6 +136,7 @@ def load_model(base_model,tokenizer_path, use_lora, frozen, llm_lora_rank=16):
                 model.base_model.model.model.language_model.new_embed_tokens = new_embed_tokens
 
     elif 'llava' in base_model:
+        from ..vlm_utils.custom_llava import CustomLlavaForConditionalGeneration
         model = CustomLlavaForConditionalGeneration.from_pretrained(
             base_model, torch_dtype=torch.bfloat16, device_map={'':torch.cuda.current_device()}, local_files_only=True, 
         )
@@ -106,6 +164,53 @@ def load_model(base_model,tokenizer_path, use_lora, frozen, llm_lora_rank=16):
                     param.requires_grad = True
                     row_mask_hook = make_row_mask_hook([32002, 32003])
                     param.register_hook(row_mask_hook)
+
+    elif 'SmolVLM' in base_model or 'Idefics' in base_model or 'smolvlm' in base_model:
+        from ..vlm_utils.custom_smolvlm import CustomIdefics3ForConditionalGeneration
+        model = CustomIdefics3ForConditionalGeneration.from_pretrained(
+            base_model, torch_dtype=torch.bfloat16, device_map={'': torch.cuda.current_device()}, local_files_only=True,
+        )
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+        if use_lora:
+            print('Using LoRA with rank', llm_lora_rank)
+            peft_config = LoraConfig(
+                r=llm_lora_rank,
+                lora_alpha=16,
+                target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
+                exclude_modules='.*vision_model.*',
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM")
+            model = get_peft_model(model, peft_config)
+
+            for name, param in model.named_parameters():
+                if 'coords' in name:
+                    param.requires_grad = True
+
+        finetune_new_token = 'with-new-special-tokens' in base_model and use_lora
+        if finetune_new_token:
+            new_lm_head = None
+            new_embed_tokens = None
+            for name, param in model.named_parameters():
+                if '.lm_head' in name or 'embed_tokens' in name:
+                    if '.lm_head' in name:
+                        new_lm_head = nn.Linear(param.shape[1], 2, bias=False).to(param.device)
+                        new_lm_head.weight.data = param.data[-2:, :]
+                        new_lm_head.requires_grad = True
+                    elif '.embed_tokens' in name:
+                        new_embed_tokens = nn.Embedding(2, param.shape[1]).to(param.device)
+                        new_embed_tokens.weight.data = param.data[-2:, :]
+                        new_embed_tokens.requires_grad = True
+                        if model._tied_weights_keys is not None:
+                            new_lm_head = nn.Linear(param.shape[1], 2, bias=False).to(param.device)
+                            new_lm_head.weight.data = param.data[-2:, :]
+                            new_lm_head.requires_grad = True
+
+            if new_lm_head is not None:
+                model.base_model.model.new_lm_head = new_lm_head
+            if new_embed_tokens is not None:
+                model.base_model.model.model.text_model.new_embed_tokens = new_embed_tokens
 
     for param in filter(lambda p: p.requires_grad,model.parameters()):
         param.data = param.data.to(torch.float32)

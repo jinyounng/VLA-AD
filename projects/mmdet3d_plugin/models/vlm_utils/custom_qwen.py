@@ -836,4 +836,3 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
             rope_deltas=self.rope_deltas,
         )
         return output if return_dict else output.to_tuple()
-

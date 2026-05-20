@@ -13,11 +13,14 @@ class_names = [
 ]
 
 ############### Training config ###############
-num_gpus = 8
+num_gpus = 2
 batch_size = 1
 num_epochs = 6 
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)
-lr = 1e-4 /2 * batch_size / 8 * num_gpus
+# Effective batch = num_gpus * batch_size * cumulative_iters (e.g. 2*1*4 = 8, same as 8*1).
+# Optimizer steps per epoch = dataset / effective_batch; max_iters is micro-batch iters per epoch.
+cumulative_iters = 4
+lr = 1e-4
 
 ############### SpaceDrive Config ###############
 vis_3d_pos = True # enable PE on vision tokens
@@ -130,7 +133,7 @@ model = dict(
 
 ############### data ###############
 dataset_type = 'CustomNuScenesDataset'
-data_root = './data/nuscenes/' 
+data_root = '/data/jykim/projects/OpenDriveVLA/data/nuscenes/'
 
 file_client_args = dict(backend='disk')
 
@@ -200,9 +203,9 @@ test_pipeline = [
          llm_type = 'qwenvl25' if 'Qwen' in llm_path else 'llava',
          load_3d_pos=True,
          load_ego_command_in_question=load_ego_command_in_question, # load command in language format in question
-         base_vqa_path='./data/nuscenes/vqa/val/', 
-         base_conv_path='./data/nuscenes/conv/val/',
-         base_counter_path='./data/nuscenes/eval_cf/',
+         base_vqa_path=data_root + 'vqa/val/',
+         base_conv_path=data_root + 'conv/val/',
+         base_counter_path=data_root + 'eval_cf/',
          load_type=["planning"], # please don't test all the questions in single test, it requires quite long time
          tokenizer=tokenizer_path,
          processor=llm_path, 
@@ -224,6 +227,8 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         ann_file=data_root + 'nuscenes2d_ego_temporal_infos_train_with_command_desc.pkl',
+        lane_path=data_root + 'data_dict_sample.pkl',
+        lane_anno_file=data_root + 'data_dict_subset_B_val.pkl',
         seq_split_num=1, # streaming video training
         seq_mode=True, # streaming video training
         pipeline=train_pipeline,
@@ -238,13 +243,17 @@ data = dict(
         eval_mode=['lane', 'det'],
         pipeline=test_pipeline, 
         ann_file=data_root + 'nuscenes2d_ego_temporal_infos_val_with_command_desc.pkl',
+        lane_path=data_root + 'data_dict_sample.pkl',
+        lane_anno_file=data_root + 'data_dict_subset_B_val.pkl',
         classes=class_names, 
         modality=input_modality),
     test=dict(
         type=dataset_type, 
         eval_mode=['lane', 'det'],
         pipeline=test_pipeline, 
-        ann_file=data_root + 'nuscenes2d_ego_temporal_infos_val_with_command_desc.pkl', 
+        ann_file=data_root + 'nuscenes2d_ego_temporal_infos_val_with_command_desc.pkl',
+        lane_path=data_root + 'data_dict_sample.pkl',
+        lane_anno_file=data_root + 'data_dict_subset_B_val.pkl',
         classes=class_names, 
         modality=input_modality),
     shuffler_sampler=dict(
@@ -267,7 +276,13 @@ optimizer = dict(constructor='LearningRateDecayOptimizerConstructor', type='Adam
                                 'num_layers': 24,
                                 })
 
-optimizer_config = dict(type='Fp16OptimizerHook', loss_scale='dynamic', grad_clip=dict(max_norm=35, norm_type=2))
+optimizer_config = dict(
+    type='GradientCumulativeFp16OptimizerHook',
+    cumulative_iters=cumulative_iters,
+    loss_scale='dynamic',
+    grad_clip=dict(max_norm=35, norm_type=2),
+    distributed=True,
+)
 # learning policy
 lr_config = dict(
     policy='CosineAnnealing',
@@ -278,7 +293,7 @@ lr_config = dict(
     )
 
 
-evaluation = dict(interval=num_iters_per_epoch*num_epochs, pipeline=test_pipeline)
+evaluation = dict(interval=num_iters_per_epoch * num_epochs, pipeline=test_pipeline)
 
 find_unused_parameters=False #### when use checkpoint, find_unused_parameters must be False
 checkpoint_config = dict(interval=num_iters_per_epoch//2, max_keep_ckpts=12)
