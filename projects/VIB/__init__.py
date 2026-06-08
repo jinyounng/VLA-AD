@@ -1,1 +1,2 @@
 from .vib_bottleneck import VIBBottleneck
+from .vision_conditioned_vib import VisionConditionedVIB

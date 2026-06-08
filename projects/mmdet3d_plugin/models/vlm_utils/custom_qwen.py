@@ -87,6 +87,7 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
+        precomputed_image_embeds: Optional[torch.Tensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
@@ -157,8 +158,9 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
 
         B = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
 
-        if pixel_values is not None:
-            pixel_values = pixel_values.reshape(-1, pixel_values.shape[-1])
+        if pixel_values is not None or precomputed_image_embeds is not None:
+            if pixel_values is not None:
+                pixel_values = pixel_values.reshape(-1, pixel_values.shape[-1])
             image_grid_thw = image_grid_thw.reshape(-1, image_grid_thw.shape[-1])
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -208,6 +210,7 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
+            precomputed_image_embeds=precomputed_image_embeds,
             second_per_grid_ts=second_per_grid_ts,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -504,6 +507,8 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             
             # Manually add 'enable_pe_input' to model_inputs
             model_inputs['enable_pe_input'] = model_kwargs.get('enable_pe_input', False)
+            if is_prefill and model_kwargs.get('precomputed_image_embeds') is not None:
+                model_inputs['precomputed_image_embeds'] = model_kwargs['precomputed_image_embeds']
             
 
             if if_next_token_pos and not model_inputs['enable_pe_input']:
@@ -536,6 +541,8 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                 #NOTE: remove the io_coords_pos from model_inputs to avoid error
                 if 'io_coords_pos' in model_inputs:
                     model_inputs.pop('io_coords_pos')
+                if 'precomputed_image_embeds' in model_inputs:
+                    model_inputs.pop('precomputed_image_embeds')
                 outputs = model_forward(**model_inputs, return_dict=True)
 
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
@@ -665,6 +672,7 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
+        precomputed_image_embeds: Optional[torch.Tensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
@@ -721,8 +729,13 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
         if enable_pe_input and io_coords_pos is not None and io_coords_pos_mask is not None:
             inputs_embeds  = inputs_embeds.masked_scatter(io_coords_pos_mask, io_coords_pos)
 
-        if pixel_values is not None:
-            image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+        if pixel_values is not None or precomputed_image_embeds is not None:
+            if precomputed_image_embeds is None:
+                image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            else:
+                image_embeds = precomputed_image_embeds
+                if isinstance(image_embeds, (list, tuple)):
+                    image_embeds = torch.cat(list(image_embeds), dim=0)
             n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
             n_image_features = image_embeds.shape[0]
             if n_image_tokens != n_image_features and ego_feature is None:

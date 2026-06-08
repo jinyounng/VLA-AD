@@ -246,6 +246,8 @@ class SpaceDriveVPER(SpaceDrive):
                     losses["gate_mean"] = torch.tensor(0.0, device=device)
                     losses["delta_norm"] = torch.tensor(0.0, device=device)
                     losses["base_l2"] = torch.tensor(0.0, device=device)
+                    losses["huber_base"] = torch.tensor(0.0, device=device)
+                    losses["huber_final"] = torch.tensor(0.0, device=device)
                 else:
                     output_pos = lm_loss["output_pos"]
                     gt_xy = lm_loss["gt_coords_xy"]
@@ -265,6 +267,11 @@ class SpaceDriveVPER(SpaceDrive):
                     losses["base_l2"] = F.mse_loss(
                         base_wp.detach(), gt_xy.detach()
                     )
+                    # Huber values logged separately for comparison with the
+                    # original SpaceDrive+ loss_pos (== huber_base). Keys must NOT
+                    # contain "loss" or mmdet would sum them into the total loss.
+                    losses["huber_base"] = loss_base.detach()
+                    losses["huber_final"] = loss_final.detach()
 
                 losses.update(loss_pos=lm_loss["loss_pos"])
 
